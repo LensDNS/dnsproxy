@@ -6,9 +6,15 @@ Language: [English](../testing.md) | **中文**
 
 - `DNSPROXY_ENABLE_NETWORK_TESTS=0`
 
-在受限网络（例如部分国内网络）中，可通过 `DNSPROXY_TEST_*` 覆写测试端点，相关定义见：
+在受限网络中，可通过 `DNSPROXY_TEST_*` 覆写测试端点，相关定义见：
 
 - `upstream/resolver_test.go`
 - `upstream/upstream_internal_test.go`
 
-国内友好测试环境变量组合见仓库根目录 [AGENTS.md](../../AGENTS.md) 中的说明。
+## 可选：QUIC / HTTP3 上游定向测试
+
+修改 `upstream/doq.go` 或 `upstream/doh.go` 后建议执行：
+
+```shell
+go test ./upstream -run "TestDNSOverQUIC_0RTT|TestUpstreamDoH_0RTT|TestUpstreamDoH_raceReconnect" -count=1
+```

@@ -12,4 +12,10 @@ For restricted networks, test endpoints can be overridden via `DNSPROXY_TEST_*` 
 - `upstream/resolver_test.go`
 - `upstream/upstream_internal_test.go`
 
-See also [AGENTS.md](../AGENTS.md) for a domestic (CN-friendly) test profile using the same variables.
+## Optional: QUIC / HTTP3 upstream directed tests
+
+After edits to `upstream/doq.go` or `upstream/doh.go`, run:
+
+```shell
+go test ./upstream -run "TestDNSOverQUIC_0RTT|TestUpstreamDoH_0RTT|TestUpstreamDoH_raceReconnect" -count=1
+```

@@ -21,6 +21,4 @@ Language: [English](../trusted-proxies.md) | **中文**
 
 调整信任策略时，请**同时**考虑 DoH 头信任与 PPv2 接受逻辑。
 
-## 维护者参考
-
-完整信任模型及 QUIC/DoH 维护说明见仓库根目录 [AGENTS.md](../../AGENTS.md)（`TrustedProxies`、DoH 与 PPv2 相关章节）。
+实现入口：DoH 客户端 IP 见 `proxy/serverhttps.go`；PPv2 见 `proxy/servertcp.go`。若调整 QUIC 或 HTTP/3 上游行为，请运行 [testing.md](testing.md) 中列出的定向上游测试。

@@ -21,6 +21,4 @@ PPv2 is accepted only when the **direct TCP peer** is in `TrustedProxies`. If `T
 
 When changing trust policy, consider **both** DoH header trust and PPv2 acceptance.
 
-## Maintainer reference
-
-The full trust model and QUIC/DoH notes for maintainers live in [AGENTS.md](../AGENTS.md) (section on `TrustedProxies`, DoH, and PPv2).
+Implementation entry points: DoH client IP handling in `proxy/serverhttps.go`; PPv2 in `proxy/servertcp.go`. When adjusting QUIC or HTTP/3 upstream behavior, run the directed upstream tests listed in [testing.md](testing.md).
