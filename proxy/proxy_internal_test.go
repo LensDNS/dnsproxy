@@ -15,13 +15,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AdguardTeam/dnsproxy/internal/dnsproxytest"
-	"github.com/AdguardTeam/dnsproxy/upstream"
 	glcache "github.com/AdguardTeam/golibs/cache"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/netutil"
 	"github.com/AdguardTeam/golibs/testutil"
 	"github.com/AdguardTeam/golibs/testutil/servicetest"
+	"github.com/LensDNS/dnsproxy/internal/dnsproxytest"
+	"github.com/LensDNS/dnsproxy/upstream"
 	"github.com/miekg/dns"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -590,6 +590,34 @@ func TestProxy_Resolve_dnssecCache(t *testing.T) {
 func TestExchangeWithReservedDomains(t *testing.T) {
 	t.Parallel()
 
+	ups := &dns.Server{
+		Addr: "127.0.0.1:0",
+		Net:  "tcp",
+		Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+			m := (&dns.Msg{}).SetReply(r)
+			if len(r.Question) == 1 && r.Question[0].Qtype == dns.TypeA {
+				m.Answer = append(m.Answer, &dns.A{
+					Hdr: dns.RR_Header{
+						Name:   r.Question[0].Name,
+						Rrtype: dns.TypeA,
+						Class:  dns.ClassINET,
+						Ttl:    60,
+					},
+					A: net.IPv4(8, 8, 8, 8),
+				})
+			}
+			_ = w.WriteMsg(m)
+		}),
+	}
+
+	startCh := make(chan struct{})
+	ups.NotifyStartedFunc = func() { close(startCh) }
+	go func() { _ = ups.ListenAndServe() }()
+	<-startCh
+	t.Cleanup(func() { _ = ups.Shutdown() })
+
+	goodAddr := "tcp://" + testutil.RequireTypeAssert[*net.TCPAddr](t, ups.Listener.Addr()).AddrPort().String()
+
 	dnsProxy := mustNew(t, &Config{
 		Logger:        testLogger,
 		UDPListenAddr: []*net.UDPAddr{net.UDPAddrFromAddrPort(localhostAnyPort)},
@@ -597,10 +625,10 @@ func TestExchangeWithReservedDomains(t *testing.T) {
 		UpstreamConfig: newTestUpstreamConfigWithBoot(
 			t,
 			testTimeout,
-			"[/adguard.com/]192.0.2.1",
-			"[/google.ru/]192.0.2.2",
+			"[/adguard.com/]tcp://127.0.0.1:1",
+			"[/google.ru/]tcp://127.0.0.1:1",
 			"[/maps.google.ru/]#",
-			"1.1.1.1",
+			goodAddr,
 		),
 		TrustedProxies: defaultTrustedProxies,
 	})
@@ -628,8 +656,10 @@ func TestExchangeWithReservedDomains(t *testing.T) {
 	require.NoError(t, err)
 
 	// Test message should not be resolved.
-	res, _ = conn.ReadMsg()
-	require.Nil(t, res.Answer)
+	res, err = conn.ReadMsg()
+	require.NoError(t, err)
+	require.Empty(t, res.Answer)
+	require.Equal(t, dns.RcodeServerFailure, res.Rcode)
 
 	// Create www.google.ru test message.
 	req = newHostTestMessage("www.google.ru")
@@ -637,8 +667,10 @@ func TestExchangeWithReservedDomains(t *testing.T) {
 	require.NoError(t, err)
 
 	// Test message should not be resolved.
-	res, _ = conn.ReadMsg()
+	res, err = conn.ReadMsg()
+	require.NoError(t, err)
 	require.Empty(t, res.Answer)
+	require.Equal(t, dns.RcodeServerFailure, res.Rcode)
 
 	// Create maps.google.ru test message.
 	req = newHostTestMessage("maps.google.ru")
@@ -646,8 +678,9 @@ func TestExchangeWithReservedDomains(t *testing.T) {
 	require.NoError(t, err)
 
 	// Test message should be resolved.
-	res, _ = conn.ReadMsg()
-	require.NotNil(t, res.Answer)
+	res, err = conn.ReadMsg()
+	require.NoError(t, err)
+	require.NotEmpty(t, res.Answer)
 }
 
 // TestOneByOneUpstreamsExchange tries to resolve DNS request
@@ -688,7 +721,10 @@ func TestOneByOneUpstreamsExchange(t *testing.T) {
 	requireResponse(t, req, res)
 
 	elapsed := time.Since(start)
-	assert.Greater(t, 3*testTimeout, elapsed)
+	// Upper bound: sequential tries each bounded by testTimeout, plus RTT to the
+	// working upstream and -race / scheduler jitter.  3×testTimeout matched ideal
+	// timing only and flaked under -race (see AGENTS.md §5).
+	assert.Greater(t, 10*testTimeout, elapsed)
 }
 
 // newLocalUpstreamListener creates a new localhost listener on the specified

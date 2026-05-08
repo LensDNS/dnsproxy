@@ -16,10 +16,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/AdguardTeam/dnsproxy/fastip"
-	"github.com/AdguardTeam/dnsproxy/internal/dnsmsg"
-	proxynetutil "github.com/AdguardTeam/dnsproxy/internal/netutil"
-	"github.com/AdguardTeam/dnsproxy/upstream"
 	"github.com/AdguardTeam/golibs/contextutil"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
@@ -28,6 +24,10 @@ import (
 	"github.com/AdguardTeam/golibs/syncutil"
 	"github.com/AdguardTeam/golibs/timeutil"
 	"github.com/AdguardTeam/golibs/validate"
+	"github.com/LensDNS/dnsproxy/fastip"
+	"github.com/LensDNS/dnsproxy/internal/dnsmsg"
+	proxynetutil "github.com/LensDNS/dnsproxy/internal/netutil"
+	"github.com/LensDNS/dnsproxy/upstream"
 	"github.com/ameshkov/dnscrypt/v2"
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go"
@@ -35,8 +35,11 @@ import (
 )
 
 const (
-	defaultTimeout   = 10 * time.Second
-	minDNSPacketSize = 12 + 5
+	defaultTimeout      = 10 * time.Second
+	defaultTLSTimeout   = 600 * time.Second
+	defaultPPv2Timeout  = 3 * time.Second
+	minDNSPacketSize    = 12 + 5
+	defaultTCPKeepAlive = 30 * time.Second
 )
 
 // Proto is the DNS protocol.
@@ -247,31 +250,15 @@ func New(c *Config) (p *Proxy, err error) {
 		return nil, err
 	}
 
-	p.CacheOptimisticAnswerTTL = cmp.Or(p.CacheOptimisticAnswerTTL, DefaultOptimisticAnswerTTL)
-	p.CacheOptimisticMaxAge = cmp.Or(p.CacheOptimisticMaxAge, DefaultOptimisticMaxAge)
+	p.applyDefaults()
 
 	p.initCache()
 
-	if p.MaxGoroutines > 0 {
-		p.logger.Info("max goroutines is set", "count", p.MaxGoroutines)
+	p.initRequestsSema()
 
-		p.requestsSema = syncutil.NewChanSemaphore(p.MaxGoroutines)
-	} else {
-		p.requestsSema = syncutil.EmptySemaphore{}
-	}
+	p.initFastestAddr()
 
-	p.UpstreamMode = cmp.Or(p.UpstreamMode, UpstreamModeLoadBalance)
-	if p.UpstreamMode == UpstreamModeFastestAddr {
-		p.fastestAddr = fastip.New(&fastip.Config{
-			Logger:          p.Logger,
-			PingWaitTimeout: p.FastestPingTimeout,
-		})
-	}
-
-	if bindRetries := c.BindRetryConfig; bindRetries != nil && bindRetries.Enabled {
-		p.bindRetryCount = bindRetries.Count
-		p.bindRetryIvl = bindRetries.Interval
-	}
+	p.initBindRetry(c)
 
 	err = p.setupDNS64()
 	if err != nil {
@@ -279,6 +266,52 @@ func New(c *Config) (p *Proxy, err error) {
 	}
 
 	return p, nil
+}
+
+func (p *Proxy) applyDefaults() {
+	p.CacheOptimisticAnswerTTL = cmp.Or(p.CacheOptimisticAnswerTTL, DefaultOptimisticAnswerTTL)
+	p.CacheOptimisticMaxAge = cmp.Or(p.CacheOptimisticMaxAge, DefaultOptimisticMaxAge)
+	p.ProxyProtocolV2ReadTimeout = cmp.Or(p.ProxyProtocolV2ReadTimeout, defaultPPv2Timeout)
+	p.UpstreamMode = cmp.Or(p.UpstreamMode, UpstreamModeLoadBalance)
+}
+
+func (p *Proxy) initRequestsSema() {
+	if p.MaxGoroutines > 0 {
+		p.logger.Info("max goroutines is set", "count", p.MaxGoroutines)
+		if (p.TCPProxyProtocolV2Enabled || p.TLSProxyProtocolV2Enabled) && p.MaxGoroutines == 1 {
+			p.logger.Warn(
+				"max goroutines is 1 while PPv2 is enabled; this can cause request queueing under concurrency",
+				"count", p.MaxGoroutines,
+			)
+		}
+
+		p.requestsSema = syncutil.NewChanSemaphore(p.MaxGoroutines)
+
+		return
+	}
+
+	p.requestsSema = syncutil.EmptySemaphore{}
+}
+
+func (p *Proxy) initFastestAddr() {
+	if p.UpstreamMode != UpstreamModeFastestAddr {
+		return
+	}
+
+	p.fastestAddr = fastip.New(&fastip.Config{
+		Logger:          p.Logger,
+		PingWaitTimeout: p.FastestPingTimeout,
+	})
+}
+
+func (p *Proxy) initBindRetry(c *Config) {
+	bindRetries := c.BindRetryConfig
+	if bindRetries == nil || !bindRetries.Enabled {
+		return
+	}
+
+	p.bindRetryCount = bindRetries.Count
+	p.bindRetryIvl = bindRetries.Interval
 }
 
 // pendingRequestsOrDefault returns the pending requests if it's not nil,

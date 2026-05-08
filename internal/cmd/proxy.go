@@ -12,16 +12,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/AdguardTeam/dnsproxy/internal/dnsmsg"
-	"github.com/AdguardTeam/dnsproxy/internal/middleware"
-	proxynetutil "github.com/AdguardTeam/dnsproxy/internal/netutil"
-	"github.com/AdguardTeam/dnsproxy/proxy"
-	"github.com/AdguardTeam/dnsproxy/ratelimit"
-	"github.com/AdguardTeam/dnsproxy/upstream"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/netutil"
 	"github.com/AdguardTeam/golibs/osutil"
+	"github.com/LensDNS/dnsproxy/internal/dnsmsg"
+	"github.com/LensDNS/dnsproxy/internal/middleware"
+	proxynetutil "github.com/LensDNS/dnsproxy/internal/netutil"
+	"github.com/LensDNS/dnsproxy/proxy"
+	"github.com/LensDNS/dnsproxy/ratelimit"
+	"github.com/LensDNS/dnsproxy/upstream"
 	"github.com/ameshkov/dnscrypt/v2"
 	"gopkg.in/yaml.v3"
 )
@@ -98,13 +98,16 @@ func createProxyConfig(
 			netip.MustParsePrefix("0.0.0.0/0"),
 			netip.MustParsePrefix("::0/0"),
 		},
-		DNSSECEnabled:          conf.DNSSECEnabled,
-		EnableEDNSClientSubnet: conf.EnableEDNSSubnet,
-		UDPBufferSize:          conf.UDPBufferSize,
-		MaxGoroutines:          conf.MaxGoRoutines,
-		UsePrivateRDNS:         conf.UsePrivateRDNS,
-		PrivateSubnets:         netutil.SubnetSetFunc(netutil.IsLocallyServed),
-		RequestHandler:         ratelimitMw.Wrap(preMw.Wrap(proxy.DefaultHandler{})),
+		EnableEDNSClientSubnet:     conf.EnableEDNSSubnet,
+		UDPBufferSize:              conf.UDPBufferSize,
+		MaxGoroutines:              conf.MaxGoRoutines,
+		UsePrivateRDNS:             conf.UsePrivateRDNS,
+		DNSSECEnabled:              conf.DNSSECEnabled,
+		TCPProxyProtocolV2Enabled:  conf.TCPProxyProtocolV2Enabled,
+		TLSProxyProtocolV2Enabled:  conf.TLSProxyProtocolV2Enabled,
+		ProxyProtocolV2ReadTimeout: time.Duration(conf.ProxyProtocolV2ReadTimeout),
+		PrivateSubnets:             netutil.SubnetSetFunc(netutil.IsLocallyServed),
+		RequestHandler:             ratelimitMw.Wrap(preMw.Wrap(proxy.DefaultHandler{})),
 		PendingRequests: &proxy.PendingRequestsConfig{
 			Enabled: conf.PendingRequestsEnabled,
 		},

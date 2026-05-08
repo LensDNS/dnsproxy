@@ -1,4 +1,4 @@
-module github.com/AdguardTeam/dnsproxy
+module github.com/LensDNS/dnsproxy
 
 go 1.26.2
 

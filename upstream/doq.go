@@ -14,10 +14,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AdguardTeam/dnsproxy/proxyutil"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/validate"
+	"github.com/LensDNS/dnsproxy/proxyutil"
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -91,6 +91,11 @@ type dnsOverQUIC struct {
 	// bytesPoolGuard protects bytesPool.
 	bytesPoolMu *sync.Mutex
 
+	// streamOpenMu serializes OpenStreamSync across concurrent Exchange calls
+	// on the same upstream, avoiding overlap with early-handshake work in
+	// quic-go under -race while keeping DialAddrEarly / 0-RTT semantics.
+	streamOpenMu *sync.Mutex
+
 	// logger is used for exchange logging.  It is never nil.
 	logger *slog.Logger
 
@@ -151,6 +156,7 @@ func newDoQ(addr *url.URL, opts *Options) (u Upstream, err error) {
 		quicConfigMu: &sync.Mutex{},
 		connMu:       &sync.Mutex{},
 		bytesPoolMu:  &sync.Mutex{},
+		streamOpenMu: &sync.Mutex{},
 		logger:       opts.Logger,
 		timeout:      opts.Timeout,
 	}
@@ -338,6 +344,9 @@ func (p *dnsOverQUIC) resetQUICConfig() {
 
 // openStream opens a new QUIC stream for the specified connection.
 func (p *dnsOverQUIC) openStream(conn *quic.Conn) (*quic.Stream, error) {
+	p.streamOpenMu.Lock()
+	defer p.streamOpenMu.Unlock()
+
 	ctx, cancel := p.withDeadline(context.Background())
 	defer cancel()
 

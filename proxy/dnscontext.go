@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"net/netip"
 
-	"github.com/AdguardTeam/dnsproxy/upstream"
+	"github.com/LensDNS/dnsproxy/upstream"
 	"github.com/ameshkov/dnscrypt/v2"
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go"
@@ -49,6 +49,10 @@ type DNSContext struct {
 	// queryStatistics contains the DNS query statistics for both the upstream
 	// and fallback DNS servers.
 	queryStatistics *QueryStatistics
+
+	// tcpConnShutdown is set by the TCP/TLS handler to close the stream with a
+	// graceful TCP/TLS shutdown.  It is nil for non-TCP protocols.
+	tcpConnShutdown func()
 
 	// Req is the request message.
 	Req *dns.Msg

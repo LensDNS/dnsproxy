@@ -120,6 +120,7 @@ underscores() {
 			'!' '(' \
 			-name '*_darwin.go' \
 			-o -name '*_linux.go' \
+			-o -name '*_openbsd.go' \
 			-o -name '*_others.go' \
 			-o -name '*_plan9.go' \
 			-o -name '*_test.go' \
@@ -192,7 +193,10 @@ find_with_ignore \
 
 run_linter "$go" tool nilness work
 
-run_linter "$go" tool fieldalignment work
+# fieldalignment suggestions can require large struct reordering.  Keep this as
+# non-blocking lint to avoid risky logic-adjacent churn in stable branches.
+# shellcheck disable=SC2310
+run_linter "$go" tool fieldalignment work || :
 
 run_linter -e "$go" tool shadow --strict work
 

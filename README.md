@@ -1,3 +1,73 @@
+# LensDNS/dnsproxy
+
+Language: **English** | [中文](README_zh.md)
+
+![LensDNS dnsproxy](assets/logo.svg)
+
+> High-performance proxy-aware DNS engine for modern TCP and TLS deployments.
+
+LensDNS dnsproxy is a hardened fork of [AdguardTeam/dnsproxy](https://github.com/AdguardTeam/dnsproxy), focused on proxy-aware deployments, preserving real client identity behind load balancers, and modern TCP/TLS operational behavior.
+
+```text
++--------+      +-------------------+   send-proxy-v2 / PPv2   +----------+      +--------------+
+| Client | ---> | HAProxy/Nginx/LB  | -----------------------> | dnsproxy | ---> | Upstream DNS |
++--------+      +-------------------+     (optional)           +----------+      +--------------+
+```
+
+The client → LB hop does not carry PPv2. When PPv2 is enabled, the load balancer injects it on the **LB → dnsproxy** connection so the backend can recover the original client address together with a tightened `TrustedProxies` policy. Details: [docs/ppv2.md](docs/ppv2.md).
+
+## Key Features
+
+- **Proxy Protocol v2** on DNS-over-TCP and DNS-over-TLS (strict mode, tunable read timeout)
+- **Real client IP** behind L4/L7 load balancers when PPv2 is combined with an appropriate **trusted proxy** configuration ([docs/trusted-proxies.md](docs/trusted-proxies.md))
+- **Robust TCP framing**: RFC 1035 length prefix always read in full (handles TCP short reads)
+- **Connection lifecycle**: mitigation for TCP close-phase RST edge cases under high concurrency
+- **DoT**: dedicated TLS timeouts, TCP keep-alive defaults, **TCP Fast Open** on supported listener platforms
+- **TLS session resumption** for DoT/HTTPS server and DoH/DoQ/DoT upstream clients
+- **`max-go-routines` default** tuned for typical LB-backed deployments (`32`)
+- **Go module** `github.com/LensDNS/dnsproxy` for distribution identity distinct from upstream
+
+## Quick Start
+
+### Docker
+
+Image on GHCR:
+
+- `ghcr.io/lensdns/dnsproxy`
+
+```shell
+docker pull ghcr.io/lensdns/dnsproxy:latest
+```
+
+### Release binary
+
+Download from [GitHub Releases](https://github.com/LensDNS/dnsproxy/releases). Preferred for automated deployments over ad-hoc builds.
+
+### Build from source
+
+Requires Go **1.26+** and `make build`. See the upstream section below (**How to build**).
+
+## Why LensDNS dnsproxy exists
+
+DNS frequently sits behind HAProxy, Nginx, cloud load balancers, or other proxies. Without a transport-level way to pass the original client to the backend, **rate limiting, abuse attribution, GeoDNS, and security telemetry** collapse to the identity of the load balancer—not the end user.
+
+This fork adds **PPv2 on TCP and DoT** on the **LB → dnsproxy** leg, restores client address semantics where configured, and keeps the **trust boundary** explicit (`TrustedProxies`, network isolation; no unsafe client-controlled PPv2 at the public edge). It also hardens **TCP/TLS lifecycle** behavior for the same operational profile.
+
+## Documentation
+
+Start at the **[documentation index](docs/README.md)** (English). **Chinese:** [docs/zh/README.md](docs/zh/README.md).
+
+- [Proxy Protocol v2 (PPv2)](docs/ppv2.md) · [中文](docs/zh/ppv2.md)
+- [Trusted proxies and client address trust](docs/trusted-proxies.md) · [中文](docs/zh/trusted-proxies.md)
+- [TCP/TLS behavior](docs/tcp-tls-behavior.md) · [中文](docs/zh/tcp-tls-behavior.md)
+- [Testing and network-dependent tests](docs/testing.md) · [中文](docs/zh/testing.md)
+
+---
+
+Below is the upstream README content.
+
+---
+
 # DNS Proxy <!-- omit in toc -->
 
 [![Code Coverage](https://img.shields.io/codecov/c/github/AdguardTeam/dnsproxy/master.svg)](https://codecov.io/github/AdguardTeam/dnsproxy?branch=master)

@@ -5,9 +5,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/AdguardTeam/dnsproxy/proxy"
 	"github.com/AdguardTeam/golibs/osutil"
 	"github.com/AdguardTeam/golibs/timeutil"
+	"github.com/LensDNS/dnsproxy/proxy"
 	"gopkg.in/yaml.v3"
 )
 
@@ -213,23 +213,37 @@ type configuration struct {
 	// lookups of private addresses, including the requests for authority
 	// records, such as SOA and NS.
 	UsePrivateRDNS bool `yaml:"use-private-rdns"`
+
+	// TCPProxyProtocolV2Enabled defines whether plain DNS-over-TCP listeners
+	// require Proxy Protocol v2 headers.
+	TCPProxyProtocolV2Enabled bool `yaml:"tcp-proxy-protocol-v2"`
+
+	// TLSProxyProtocolV2Enabled defines whether DNS-over-TLS listeners require
+	// Proxy Protocol v2 headers before TLS handshake.
+	TLSProxyProtocolV2Enabled bool `yaml:"tls-proxy-protocol-v2"`
+
+	// ProxyProtocolV2ReadTimeout bounds how long dnsproxy waits for an incoming
+	// PPv2 preface and payload after accepting a TCP/TLS connection.
+	ProxyProtocolV2ReadTimeout timeutil.Duration `yaml:"proxy-protocol-v2-read-timeout"`
 }
 
 // parseConfig returns options parsed from the command args or config file.  If
 // no options have been parsed, it returns a suitable exit code and an error.
 func parseConfig() (conf *configuration, exitCode int, err error) {
 	conf = &configuration{
-		HTTPSServerName:        "dnsproxy",
-		UpstreamMode:           string(proxy.UpstreamModeLoadBalance),
-		CacheSizeBytes:         64 * 1024,
-		Timeout:                timeutil.Duration(10 * time.Second),
-		OptimisticAnswerTTL:    timeutil.Duration(proxy.DefaultOptimisticAnswerTTL),
-		OptimisticMaxAge:       timeutil.Duration(proxy.DefaultOptimisticMaxAge),
-		RatelimitSubnetLenIPv4: 24,
-		RatelimitSubnetLenIPv6: 56,
-		DNSSECEnabled:          true,
-		HostsFileEnabled:       true,
-		PendingRequestsEnabled: true,
+		HTTPSServerName:            "dnsproxy",
+		UpstreamMode:               string(proxy.UpstreamModeLoadBalance),
+		CacheSizeBytes:             64 * 1024,
+		MaxGoRoutines:              32,
+		Timeout:                    timeutil.Duration(10 * time.Second),
+		OptimisticAnswerTTL:        timeutil.Duration(proxy.DefaultOptimisticAnswerTTL),
+		OptimisticMaxAge:           timeutil.Duration(proxy.DefaultOptimisticMaxAge),
+		RatelimitSubnetLenIPv4:     24,
+		RatelimitSubnetLenIPv6:     56,
+		DNSSECEnabled:              true,
+		HostsFileEnabled:           true,
+		PendingRequestsEnabled:     true,
+		ProxyProtocolV2ReadTimeout: timeutil.Duration(3 * time.Second),
 	}
 
 	err = parseCmdLineOptions(conf)

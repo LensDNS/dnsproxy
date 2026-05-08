@@ -1,22 +1,41 @@
 package proxy
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
+	"sync"
 	"time"
 
-	"github.com/AdguardTeam/dnsproxy/internal/bootstrap"
-	proxynetutil "github.com/AdguardTeam/dnsproxy/internal/netutil"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/netutil"
 	"github.com/AdguardTeam/golibs/syncutil"
+	"github.com/LensDNS/dnsproxy/internal/bootstrap"
+	proxynetutil "github.com/LensDNS/dnsproxy/internal/netutil"
 	"github.com/miekg/dns"
 )
+
+const (
+	// tcpGracefulShutdownLinger is a short delay before half-closing a TCP or
+	// TLS stream so the peer can read queued data.
+	tcpGracefulShutdownLinger = 80 * time.Millisecond
+
+	// tcpReadDrainTimeout bounds how long we wait for the peer to finish the
+	// close handshake after CloseWrite.
+	tcpReadDrainTimeout = 2 * time.Second
+
+	// proxyProtocolV2HeaderLen is the minimal Proxy Protocol v2 header size.
+	proxyProtocolV2HeaderLen = 16
+)
+
+var proxyProtocolV2Signature = [...]byte{0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a}
 
 // initTCPListeners initializes TCP listeners with configured addresses.
 func (p *Proxy) initTCPListeners(ctx context.Context) (err error) {
@@ -66,22 +85,36 @@ func (p *Proxy) listenTCP(ctx context.Context, addr *net.TCPAddr) (ln *net.TCPLi
 // initTLSListeners initializes TLS listeners with configured addresses.
 func (p *Proxy) initTLSListeners(ctx context.Context) (err error) {
 	for _, addr := range p.TLSListenAddr {
-		p.logger.InfoContext(ctx, "creating tls server socket", "addr", addr)
+		addrStr := addr.String()
+		p.logger.InfoContext(ctx, "creating tls server socket", "addr", addrStr)
+
+		conf := proxynetutil.ListenConfigTLS(p.logger)
 
 		var tcpListen *net.TCPListener
 		err = p.bindWithRetry(ctx, func() (listenErr error) {
-			tcpListen, listenErr = net.ListenTCP("tcp", addr)
+			var listener net.Listener
+			listener, listenErr = conf.Listen(ctx, bootstrap.NetworkTCP, addrStr)
+			if listenErr != nil {
+				return listenErr
+			}
 
-			return listenErr
+			var ok bool
+			tcpListen, ok = listener.(*net.TCPListener)
+			if !ok {
+				// TODO(e.burkov):  Close the listener.
+
+				return fmt.Errorf("bad listener type: %T", listener)
+			}
+
+			return nil
 		})
 		if err != nil {
 			return fmt.Errorf("listening on tls addr %s: %w", addr, err)
 		}
 
-		l := tls.NewListener(tcpListen, p.TLSConfig)
-		p.tlsListen = append(p.tlsListen, l)
+		p.tlsListen = append(p.tlsListen, tcpListen)
 
-		p.logger.InfoContext(ctx, "listening to tls", "addr", l.Addr())
+		p.logger.InfoContext(ctx, "listening to tls", "addr", tcpListen.Addr())
 	}
 
 	return nil
@@ -111,13 +144,6 @@ func (p *Proxy) tcpPacketLoop(
 			break
 		}
 
-		err = reqSema.Acquire(ctx)
-		if err != nil {
-			p.logger.ErrorContext(ctx, "acquiring sema", "proto", ProtoTCP, slogutil.KeyError, err)
-
-			break
-		}
-
 		go p.handleTCPConnection(ctx, clientConn, proto, reqSema)
 	}
 }
@@ -131,49 +157,473 @@ func (p *Proxy) handleTCPConnection(
 	reqSema syncutil.Semaphore,
 ) {
 	defer slogutil.RecoverAndLog(ctx, p.logger)
-	defer reqSema.Release()
-	defer func() {
-		err := conn.Close()
-		if err != nil {
-			logWithNonCrit(ctx, err, "closing conn", ProtoTCP, p.logger)
-		}
-	}()
 
-	p.logger.DebugContext(ctx, "handling new request", "proto", proto, "raddr", conn.RemoteAddr())
+	var shutdownOnce sync.Once
+	clientInitiatedClose := false
+	shutdown := func() {
+		shutdownOnce.Do(func() {
+			p.shutdownTCPConnGracefully(ctx, conn, proto, clientInitiatedClose)
+		})
+	}
+
+	defer shutdown()
+
+	p.setTCPKeepAlive(ctx, conn)
+
+	var clientAddr netip.AddrPort
+	conn, clientAddr, err := p.prepareConn(ctx, conn, proto)
+	if err != nil {
+		logWithNonCrit(ctx, err, "preparing connection", proto, p.logger)
+
+		return
+	}
+
+	p.logger.DebugContext(ctx, "handling new request", "proto", proto, "raddr", clientAddr)
 
 	ctx, cancel := p.reqCtx.New(ctx)
 	defer cancel()
 
 	for p.isStarted() {
-		err := conn.SetDeadline(time.Now().Add(defaultTimeout))
-		if err != nil {
-			// Consider deadline errors non-critical.
-			logWithNonCrit(ctx, err, "setting deadline", ProtoTCP, p.logger)
-		}
+		p.setConnReadOrFullDeadline(ctx, conn, proto)
 
-		req := p.readDNSReq(ctx, conn)
-		if req == nil {
+		req, ok := p.readDNSReqForTCP(ctx, conn, proto, &clientInitiatedClose)
+		if !ok {
 			return
 		}
 
-		d := p.newDNSContext(proto, req, netutil.NetAddrToAddrPort(conn.RemoteAddr()))
+		d := p.newDNSContext(proto, req, clientAddr)
 		d.Conn = conn
+		d.tcpConnShutdown = shutdown
+
+		err = reqSema.Acquire(ctx)
+		if err != nil {
+			p.logger.ErrorContext(ctx, "acquiring sema for tcp request", "proto", proto, slogutil.KeyError, err)
+
+			return
+		}
 
 		err = p.handleDNSRequest(ctx, d)
+		reqSema.Release()
 		if err != nil {
-			logWithNonCrit(ctx, err, "handling request", ProtoTCP, p.logger)
+			logWithNonCrit(ctx, err, "handling request", proto, p.logger)
 		}
+	}
+}
+
+// setTCPKeepAlive enables TCP keepalive when possible.
+func (p *Proxy) setTCPKeepAlive(ctx context.Context, conn net.Conn) {
+	rawConn := conn
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		rawConn = tlsConn.NetConn()
+	}
+
+	tcpConn, ok := rawConn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+
+	err := tcpConn.SetKeepAlive(true)
+	if err != nil {
+		logWithNonCrit(ctx, err, "setting keepalive", ProtoTCP, p.logger)
+
+		return
+	}
+
+	err = tcpConn.SetKeepAlivePeriod(defaultTCPKeepAlive)
+	if err != nil {
+		logWithNonCrit(ctx, err, "setting keepalive period", ProtoTCP, p.logger)
+	}
+}
+
+// setConnReadOrFullDeadline sets the proper deadline for TCP/TLS connections.
+func (p *Proxy) setConnReadOrFullDeadline(ctx context.Context, conn net.Conn, proto Proto) {
+	err := setTCPReadOrFullDeadline(conn, proto)
+	if err != nil {
+		logWithNonCrit(ctx, err, tcpDeadlineMsg(proto), proto, p.logger)
+	}
+}
+
+func setTCPReadOrFullDeadline(conn net.Conn, proto Proto) (err error) {
+	if proto == ProtoTLS {
+		// DoT: read deadline only so outbound responses are not tied to the idle
+		// read window (avoids premature full-deadline shutdown vs long-lived clients).
+		return conn.SetReadDeadline(time.Now().Add(defaultTLSTimeout))
+	}
+
+	return conn.SetDeadline(time.Now().Add(defaultTimeout))
+}
+
+func tcpDeadlineMsg(proto Proto) (msg string) {
+	if proto == ProtoTLS {
+		return "setting read deadline"
+	}
+
+	return "setting deadline"
+}
+
+func (p *Proxy) readDNSReqForTCP(
+	ctx context.Context,
+	conn net.Conn,
+	proto Proto,
+	clientInitiatedClose *bool,
+) (req *dns.Msg, ok bool) {
+	req, rerr := p.readDNSReq(ctx, conn, proto)
+	if rerr != nil {
+		if errors.Is(rerr, io.EOF) {
+			*clientInitiatedClose = true
+		}
+
+		return nil, false
+	}
+	if req == nil {
+		return nil, false
+	}
+
+	return req, true
+}
+
+// bufferedConn preserves bytes peeked from the reader while still exposing
+// [net.Conn] methods.
+type bufferedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+// Read implements [net.Conn].
+func (c *bufferedConn) Read(b []byte) (n int, err error) {
+	return c.reader.Read(b)
+}
+
+// prepareConn applies Proxy Protocol v2 policy and performs TLS handshake
+// where needed.  It returns the effective client address.
+func (p *Proxy) prepareConn(
+	ctx context.Context,
+	conn net.Conn,
+	proto Proto,
+) (prepared net.Conn, clientAddr netip.AddrPort, err error) {
+	clientAddr = netutil.NetAddrToAddrPort(conn.RemoteAddr())
+	ppEnabled := p.proxyProtocolV2Enabled(proto)
+
+	if proto != ProtoTCP && proto != ProtoTLS {
+		return conn, clientAddr, nil
+	}
+
+	bconn := &bufferedConn{
+		Conn:   conn,
+		reader: bufio.NewReader(conn),
+	}
+
+	p.setInitialReadDeadline(ctx, conn, proto, ppEnabled)
+
+	bconn, clientAddr, err = p.applyProxyProtocolV2(ctx, bconn, clientAddr, ppEnabled)
+	if err != nil {
+		return nil, netip.AddrPort{}, err
+	}
+
+	if proto != ProtoTLS {
+		return bconn, clientAddr, nil
+	}
+
+	prepared, err = p.prepareTLSConn(ctx, bconn)
+	if err != nil {
+		return nil, netip.AddrPort{}, err
+	}
+
+	return prepared, clientAddr, nil
+}
+
+func (p *Proxy) setInitialReadDeadline(
+	ctx context.Context,
+	conn net.Conn,
+	proto Proto,
+	ppEnabled bool,
+) {
+	timeout := defaultTimeout
+	if proto == ProtoTLS {
+		timeout = defaultTLSTimeout
+	}
+
+	if ppEnabled && timeout > p.ProxyProtocolV2ReadTimeout {
+		timeout = p.ProxyProtocolV2ReadTimeout
+	}
+
+	// Bound PPv2 detection/parse and (for DoT) the TLS handshake time.
+	//
+	// Without it, a client can connect and not send anything, blocking the
+	// per-connection handler on Peek/ReadFull.
+	err := conn.SetReadDeadline(time.Now().Add(timeout))
+	if err != nil {
+		logWithNonCrit(ctx, err, "setting initial read deadline", proto, p.logger)
+	}
+}
+
+func (p *Proxy) applyProxyProtocolV2(
+	ctx context.Context,
+	conn *bufferedConn,
+	clientAddr netip.AddrPort,
+	ppEnabled bool,
+) (prepared *bufferedConn, effectiveClientAddr netip.AddrPort, err error) {
+	hasHeader, err := hasProxyProtocolV2Signature(conn.reader)
+	if err != nil {
+		return nil, netip.AddrPort{}, fmt.Errorf("detecting proxy protocol v2: %w", err)
+	}
+
+	err = validateProxyProtocolV2Policy(ppEnabled, hasHeader)
+	if err != nil {
+		return nil, netip.AddrPort{}, err
+	}
+
+	effectiveClientAddr = clientAddr
+	if hasHeader {
+		effectiveClientAddr, err = p.consumeProxyProtocolV2(ctx, conn.reader, clientAddr)
+		if err != nil {
+			return nil, netip.AddrPort{}, err
+		}
+	}
+
+	return conn, effectiveClientAddr, nil
+}
+
+func validateProxyProtocolV2Policy(ppEnabled, hasHeader bool) (err error) {
+	switch {
+	case !ppEnabled && hasHeader:
+		return errors.Error("proxy protocol v2 header is not allowed")
+	case ppEnabled && !hasHeader:
+		return errors.Error("proxy protocol v2 header is required")
+	default:
+		return nil
+	}
+}
+
+func (p *Proxy) prepareTLSConn(ctx context.Context, conn net.Conn) (tlsConn *tls.Conn, err error) {
+	err = conn.SetDeadline(time.Now().Add(defaultTLSTimeout))
+	if err != nil {
+		logWithNonCrit(ctx, err, "setting tls handshake deadline", ProtoTLS, p.logger)
+	}
+
+	tlsConn = tls.Server(conn, p.TLSConfig)
+	err = tlsConn.Handshake()
+	if err != nil {
+		return nil, fmt.Errorf("tls handshake: %w", err)
+	}
+
+	_ = tlsConn.SetDeadline(time.Time{})
+
+	return tlsConn, nil
+}
+
+// proxyProtocolV2Enabled returns true if Proxy Protocol v2 is enabled for proto.
+func (p *Proxy) proxyProtocolV2Enabled(proto Proto) (ok bool) {
+	switch proto {
+	case ProtoTCP:
+		return p.TCPProxyProtocolV2Enabled
+	case ProtoTLS:
+		return p.TLSProxyProtocolV2Enabled
+	default:
+		return false
+	}
+}
+
+// hasProxyProtocolV2Signature checks if the stream starts with the v2 signature.
+func hasProxyProtocolV2Signature(r *bufio.Reader) (ok bool, err error) {
+	prefix, err := r.Peek(len(proxyProtocolV2Signature))
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return false, nil
+		}
+
+		return false, fmt.Errorf("peeking signature: %w", err)
+	}
+
+	return bytes.Equal(prefix, proxyProtocolV2Signature[:]), nil
+}
+
+// consumeProxyProtocolV2 validates and consumes Proxy Protocol v2 header.
+func (p *Proxy) consumeProxyProtocolV2(
+	ctx context.Context,
+	r *bufio.Reader,
+	remoteAddr netip.AddrPort,
+) (clientAddr netip.AddrPort, err error) {
+	cmd, famProto, payloadLen, err := p.readProxyProtocolV2Meta(r, remoteAddr)
+	if err != nil {
+		return netip.AddrPort{}, err
+	}
+
+	localCmd, err := consumeProxyProtocolV2Command(r, cmd, payloadLen)
+	if err != nil {
+		return netip.AddrPort{}, err
+	}
+	if localCmd {
+		return remoteAddr, nil
+	}
+
+	requiredPayloadLen, err := requiredProxyProtocolV2PayloadLen(famProto)
+	if err != nil {
+		err = errors.WithDeferred(err, discardProxyProtocolV2Payload(r, payloadLen))
+
+		return netip.AddrPort{}, err
+	}
+
+	if payloadLen < requiredPayloadLen {
+		// Keep the error shape identical to parseProxyProtocolV2Addr.
+		if requiredPayloadLen == 12 {
+			return netip.AddrPort{}, errors.Error("proxy protocol v2 payload is too short for ipv4")
+		}
+
+		return netip.AddrPort{}, errors.Error("proxy protocol v2 payload is too short for ipv6")
+	}
+
+	payload, err := readProxyProtocolV2AddrPayload(r, payloadLen, requiredPayloadLen)
+	if err != nil {
+		return netip.AddrPort{}, err
+	}
+
+	addr, parseErr := parseProxyProtocolV2Addr(famProto, payload)
+	if parseErr != nil {
+		return netip.AddrPort{}, parseErr
+	}
+
+	p.logger.DebugContext(ctx, "accepted proxy protocol v2 header", "proxy_addr", remoteAddr, "client_addr", addr)
+
+	return addr, nil
+}
+
+func (p *Proxy) readProxyProtocolV2Meta(
+	r *bufio.Reader,
+	remoteAddr netip.AddrPort,
+) (cmd, famProto byte, payloadLen int, err error) {
+	if !p.TrustedProxies.Contains(remoteAddr.Addr()) {
+		return 0, 0, 0, fmt.Errorf("proxy protocol source %s is not trusted", remoteAddr)
+	}
+
+	header := make([]byte, proxyProtocolV2HeaderLen)
+	_, err = io.ReadFull(r, header)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("reading proxy protocol v2 header: %w", err)
+	}
+
+	if !bytes.Equal(header[:len(proxyProtocolV2Signature)], proxyProtocolV2Signature[:]) {
+		return 0, 0, 0, errors.Error("bad proxy protocol v2 signature")
+	}
+
+	verCmd := header[12]
+	if verCmd>>4 != 0x2 {
+		return 0, 0, 0, fmt.Errorf("unsupported proxy protocol version: %d", verCmd>>4)
+	}
+
+	return verCmd & 0x0f, header[13], int(binary.BigEndian.Uint16(header[14:16])), nil
+}
+
+func consumeProxyProtocolV2Command(r *bufio.Reader, cmd byte, payloadLen int) (local bool, err error) {
+	switch cmd {
+	case 0x00:
+		// LOCAL command intentionally preserves the immediate peer address.
+		//
+		// We still must consume the whole payload to keep the stream aligned.
+		err = discardProxyProtocolV2Payload(r, payloadLen)
+		if err != nil {
+			return false, err
+		}
+
+		return true, nil
+	case 0x01:
+		return false, nil
+	default:
+		err = errors.WithDeferred(
+			fmt.Errorf("unsupported proxy protocol command: %d", cmd),
+			discardProxyProtocolV2Payload(r, payloadLen),
+		)
+
+		return false, err
+	}
+}
+
+func requiredProxyProtocolV2PayloadLen(famProto byte) (requiredPayloadLen int, err error) {
+	switch famProto >> 4 {
+	case 0x1:
+		return 12, nil // ipv4 (10 bytes address fields + ports)
+	case 0x2:
+		return 36, nil // ipv6
+	default:
+		return 0, fmt.Errorf("unsupported proxy protocol v2 address family: %d", famProto>>4)
+	}
+}
+
+func discardProxyProtocolV2Payload(r *bufio.Reader, payloadLen int) (err error) {
+	_, err = io.CopyN(io.Discard, r, int64(payloadLen))
+	if err != nil {
+		return fmt.Errorf("discarding proxy protocol v2 payload: %w", err)
+	}
+
+	return nil
+}
+
+func readProxyProtocolV2AddrPayload(
+	r *bufio.Reader,
+	payloadLen int,
+	requiredPayloadLen int,
+) (payload []byte, err error) {
+	// Read only what's required to extract client source address and port.
+	payload = make([]byte, requiredPayloadLen)
+	_, err = io.ReadFull(r, payload)
+	if err != nil {
+		return nil, fmt.Errorf("reading proxy protocol v2 payload: %w", err)
+	}
+
+	// Discard any trailing TLVs/fields we don't need for client address.
+	discarded := payloadLen - requiredPayloadLen
+	if discarded > 0 {
+		_, err = io.CopyN(io.Discard, r, int64(discarded))
+		if err != nil {
+			return nil, fmt.Errorf("discarding proxy protocol v2 payload remainder: %w", err)
+		}
+	}
+
+	return payload, nil
+}
+
+// parseProxyProtocolV2Addr extracts source address from Proxy Protocol v2 payload.
+func parseProxyProtocolV2Addr(famProto byte, payload []byte) (addr netip.AddrPort, err error) {
+	switch famProto >> 4 {
+	case 0x1:
+		if len(payload) < 12 {
+			return netip.AddrPort{}, errors.Error("proxy protocol v2 payload is too short for ipv4")
+		}
+
+		src, ok := netip.AddrFromSlice(payload[:4])
+		if !ok {
+			return netip.AddrPort{}, errors.Error("invalid proxy protocol v2 ipv4 source address")
+		}
+
+		port := binary.BigEndian.Uint16(payload[8:10])
+
+		return netip.AddrPortFrom(src.Unmap(), port), nil
+	case 0x2:
+		if len(payload) < 36 {
+			return netip.AddrPort{}, errors.Error("proxy protocol v2 payload is too short for ipv6")
+		}
+
+		src, ok := netip.AddrFromSlice(payload[:16])
+		if !ok {
+			return netip.AddrPort{}, errors.Error("invalid proxy protocol v2 ipv6 source address")
+		}
+
+		port := binary.BigEndian.Uint16(payload[32:34])
+
+		return netip.AddrPortFrom(src, port), nil
+	default:
+		return netip.AddrPort{}, fmt.Errorf("unsupported proxy protocol v2 address family: %d", famProto>>4)
 	}
 }
 
 // readDNSReq returns DNS request message from the given connection or nil if
 // it failed to read it.  Properly logs the error if it happened.
-func (p *Proxy) readDNSReq(ctx context.Context, conn net.Conn) (req *dns.Msg) {
+func (p *Proxy) readDNSReq(ctx context.Context, conn net.Conn, proto Proto) (req *dns.Msg, err error) {
 	packet, err := readPrefixed(conn)
 	if err != nil {
-		logWithNonCrit(ctx, err, "reading msg", ProtoTCP, p.logger)
+		logWithNonCrit(ctx, err, "reading msg", proto, p.logger)
 
-		return nil
+		return nil, err
 	}
 
 	req = &dns.Msg{}
@@ -181,10 +631,10 @@ func (p *Proxy) readDNSReq(ctx context.Context, conn net.Conn) (req *dns.Msg) {
 	if err != nil {
 		p.logger.ErrorContext(ctx, "handling tcp; unpacking msg", slogutil.KeyError, err)
 
-		return nil
+		return nil, err
 	}
 
-	return req
+	return req, nil
 }
 
 // errTooLarge means that a DNS message is larger than 64KiB.
@@ -194,7 +644,7 @@ const errTooLarge errors.Error = "dns message is too large"
 // length from conn.
 func readPrefixed(conn net.Conn) (b []byte, err error) {
 	l := make([]byte, 2)
-	_, err = conn.Read(l)
+	_, err = io.ReadFull(conn, l)
 	if err != nil {
 		return nil, fmt.Errorf("reading len: %w", err)
 	}
@@ -213,13 +663,92 @@ func readPrefixed(conn net.Conn) (b []byte, err error) {
 	return b, nil
 }
 
+// shutdownTCPConnGracefully closes the connection.  For DNS-over-TLS, avoid
+// CloseWrite()+TCP half-close first: that emits server-first FIN and raises tail
+// RST risk with some clients in crossed shutdown; tls.Conn.Close sends
+// close_notify and releases the socket.  Plain TCP keeps half-close+drain.
+func (p *Proxy) shutdownTCPConnGracefully(
+	ctx context.Context,
+	conn net.Conn,
+	proto Proto,
+	clientInitiatedClose bool,
+) {
+	switch c := conn.(type) {
+	case *bufferedConn:
+		p.shutdownTCPConnGracefully(ctx, c.Conn, proto, clientInitiatedClose)
+	case *tls.Conn:
+		p.shutdownTLSConnGracefully(ctx, c, proto, clientInitiatedClose)
+	case *net.TCPConn:
+		p.shutdownPlainTCPConnGracefully(ctx, c, proto)
+	default:
+		p.shutdownGenericConn(ctx, conn, proto)
+	}
+}
+
+func (p *Proxy) shutdownTLSConnGracefully(
+	ctx context.Context,
+	conn *tls.Conn,
+	proto Proto,
+	clientInitiatedClose bool,
+) {
+	if clientInitiatedClose {
+		// The peer has already closed the connection.  Avoid writing TLS
+		// records (close_notify) and just close the underlying transport.
+		err := conn.NetConn().Close()
+		if err != nil {
+			logWithNonCrit(ctx, err, "closing tls net conn", proto, p.logger)
+		}
+
+		return
+	}
+
+	err := conn.Close()
+	if err != nil {
+		logWithNonCrit(ctx, err, "closing tls conn", proto, p.logger)
+	}
+}
+
+func (p *Proxy) shutdownPlainTCPConnGracefully(ctx context.Context, conn *net.TCPConn, proto Proto) {
+	time.Sleep(tcpGracefulShutdownLinger)
+
+	err := conn.CloseWrite()
+	if err != nil {
+		logWithNonCrit(ctx, err, "tcp close write", proto, p.logger)
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(tcpReadDrainTimeout))
+
+	_, err = io.Copy(io.Discard, conn)
+	if err != nil && !errors.Is(err, io.EOF) {
+		logWithNonCrit(ctx, err, "draining tcp conn", proto, p.logger)
+	}
+
+	err = conn.Close()
+	if err != nil {
+		logWithNonCrit(ctx, err, "closing tcp conn", proto, p.logger)
+	}
+}
+
+func (p *Proxy) shutdownGenericConn(ctx context.Context, conn net.Conn, proto Proto) {
+	err := conn.Close()
+	if err != nil {
+		logWithNonCrit(ctx, err, "closing conn", proto, p.logger)
+	}
+}
+
 // Writes a response to the TCP (or TLS) client
 func (p *Proxy) respondTCP(d *DNSContext) error {
 	resp := d.Res
 	conn := d.Conn
 
 	if resp == nil {
-		// If no response has been written, close the connection right away
+		// If no response has been written, close the connection right away.
+		if d.tcpConnShutdown != nil {
+			d.tcpConnShutdown()
+
+			return nil
+		}
+
 		return conn.Close()
 	}
 

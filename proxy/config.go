@@ -9,10 +9,10 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/AdguardTeam/dnsproxy/upstream"
 	"github.com/AdguardTeam/golibs/contextutil"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/netutil"
+	"github.com/LensDNS/dnsproxy/upstream"
 	"github.com/ameshkov/dnscrypt/v2"
 )
 
@@ -177,6 +177,20 @@ type Config struct {
 
 	// RefuseAny makes proxy refuse the requests of type ANY.
 	RefuseAny bool
+
+	// TCPProxyProtocolV2Enabled defines whether plain DNS-over-TCP listeners
+	// require Proxy Protocol v2 headers.
+	TCPProxyProtocolV2Enabled bool
+
+	// TLSProxyProtocolV2Enabled defines whether DNS-over-TLS listeners require
+	// Proxy Protocol v2 headers before TLS handshake.
+	TLSProxyProtocolV2Enabled bool
+
+	// ProxyProtocolV2ReadTimeout bounds the pre-DNS stage when waiting for the
+	// PPv2 signature and payload from a newly accepted connection.
+	//
+	// Zero value means using a built-in default.
+	ProxyProtocolV2ReadTimeout time.Duration
 
 	// DNSSECEnabled specifies if the proxy should set the DO bits in the
 	// upstream requests.

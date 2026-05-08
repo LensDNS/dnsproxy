@@ -13,7 +13,14 @@ listen-addrs:
   - "0.0.0.0"
 listen-ports:
   - 53
-max-go-routines: 0
+# Require Proxy Protocol v2 headers for plain DNS-over-TCP listeners.
+tcp-proxy-protocol-v2: false
+# Require Proxy Protocol v2 headers for DNS-over-TLS listeners.
+tls-proxy-protocol-v2: false
+# Timeout for reading Proxy Protocol v2 preface/payload on new TCP/TLS connections.
+proxy-protocol-v2-read-timeout: '3s'
+# Recommended default for PPv2 deployments; tune by host capacity.
+max-go-routines: 32
 ratelimit: 0
 ratelimit-subnet-len-ipv4: 24
 ratelimit-subnet-len-ipv6: 64
